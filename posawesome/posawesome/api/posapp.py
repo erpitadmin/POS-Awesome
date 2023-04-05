@@ -53,6 +53,7 @@ def get_opening_dialog_data():
         fields=["*"],
         limit_page_length=0,
         order_by="parent",
+        ignore_permissions=True
     )
 
     return data
@@ -355,9 +356,15 @@ def update_invoice(data):
     frappe.flags.ignore_account_permission = True
 
     if invoice_doc.is_return and invoice_doc.return_against:
-        ref_doc = frappe.get_doc(invoice_doc.doctype, invoice_doc.return_against)
+        ref_doc = frappe.get_cached_doc(invoice_doc.doctype, invoice_doc.return_against)
         if not ref_doc.update_stock:
             invoice_doc.update_stock = 0
+        if len(invoice_doc.payments) == 0:
+            invoice_doc.payments = ref_doc.payments
+        invoice_doc.paid_amount = invoice_doc.rounded_total or invoice_doc.grand_total or invoice_doc.total
+        for payment in invoice_doc.payments:
+            if payment.default:
+                payment.amount = invoice_doc.paid_amount
     allow_zero_rated_items = frappe.get_cached_value(
         "POS Profile", invoice_doc.pos_profile, "posa_allow_zero_rated_items"
     )
@@ -678,6 +685,7 @@ def get_available_credit(customer, company):
             "party_type": "Customer",
             "party": customer,
             "company": company,
+            "docstatus": 1,
         },
         ["name", "unallocated_amount"],
     )
@@ -829,35 +837,66 @@ def get_stock_availability(item_code, warehouse):
 
 @frappe.whitelist()
 def create_customer(
+    customer_id,
     customer_name,
     company,
-    tax_id,
-    mobile_no,
-    email_id,
+    tax_id=None,
+    mobile_no=None,
+    email_id=None,
     referral_code=None,
     birthday=None,
     customer_group=None,
     territory=None,
+    customer_type=None,
+    gender=None,
+    method='create',
 ):
-    if not frappe.db.exists("Customer", {"customer_name": customer_name}):
-        customer = frappe.get_doc(
-            {
-                "doctype": "Customer",
-                "customer_name": customer_name,
-                "posa_referral_company": company,
-                "tax_id": tax_id,
-                "mobile_no": mobile_no,
-                "email_id": email_id,
-                "posa_referral_code": referral_code,
-                "posa_birthday": birthday,
-            }
-        )
-        if customer_group:
-            customer.customer_group = customer_group
-        if territory:
-            customer.territory = territory
-        customer.save(ignore_permissions=True)
-        return customer
+    if method == 'create':
+        if not frappe.db.exists("Customer", {"customer_name": customer_name}):
+            customer = frappe.get_doc(
+                {
+                    "doctype": "Customer",
+                    "customer_name": customer_name,
+                    "posa_referral_company": company,
+                    "tax_id": tax_id,
+                    "mobile_no": mobile_no,
+                    "email_id": email_id,
+                    "posa_referral_code": referral_code,
+                    "posa_birthday": birthday,
+                    "customer_type": customer_type,
+                    "gender": gender,
+                }
+            )
+            if customer_group:
+                customer.customer_group = customer_group
+            else:
+                customer.customer_group = "All Customer Groups"
+            if territory:
+                customer.territory = territory
+            else:
+                customer.territory = "All Territories"
+            customer.save()
+            return customer
+        else:
+            frappe.throw(_("Customer already exists"))
+
+    elif method == 'update':
+        customer_doc = frappe.get_doc("Customer", customer_id)
+        customer_doc.customer_name = customer_name
+        customer_doc.posa_referral_company = company
+        customer_doc.tax_id = tax_id
+        customer_doc.posa_referral_code = referral_code
+        customer_doc.posa_birthday = birthday
+        customer_doc.customer_type = customer_type
+        customer_doc.territory = territory
+        customer_doc.customer_group = customer_group
+        customer_doc.gender = gender
+        customer_doc.save()
+        if mobile_no != customer_doc.mobile_no:
+            set_customer_info(customer_doc.name, "mobile_no", mobile_no)
+        if email_id != customer_doc.email_id:
+            set_customer_info(customer_doc.name, "email_id", email_id)
+        return customer_doc
 
 
 @frappe.whitelist()
@@ -930,7 +969,7 @@ def get_items_from_barcode(selling_price_list, currency, barcode):
 
 
 @frappe.whitelist()
-def set_customer_info(fieldname, customer, value=""):
+def set_customer_info(customer, fieldname, value=""):
     if fieldname == "loyalty_program":
         frappe.db.set_value("Customer", customer, "loyalty_program", value)
 
@@ -1233,6 +1272,15 @@ def get_new_payment_request(doc, mop):
     return make_payment_request(**args)
 
 
+def get_payment_gateway_account(args):
+	return frappe.db.get_value(
+		"Payment Gateway Account",
+		args,
+		["name", "payment_gateway", "payment_account", "message"],
+		as_dict=1,
+	)
+
+
 def get_existing_payment_request(doc, pay):
     payment_gateway_account = frappe.db.get_value(
         "Payment Gateway Account",
@@ -1251,7 +1299,7 @@ def get_existing_payment_request(doc, pay):
     }
     pr = frappe.db.exists(args)
     if pr:
-        return frappe.get_doc("Payment Request", pr[0][0])
+        return frappe.get_doc("Payment Request", pr)
 
 
 def make_payment_request(**args):
@@ -1260,7 +1308,9 @@ def make_payment_request(**args):
     args = frappe._dict(args)
 
     ref_doc = frappe.get_doc(args.dt, args.dn)
-    gateway_account = get_gateway_details(args) or frappe._dict()
+    gateway_account = get_payment_gateway_account(args.get("payment_gateway_account"))
+    if not gateway_account:
+        frappe.throw(_("Payment Gateway Account not found")) 
 
     grand_total = get_amount(ref_doc, gateway_account.get("payment_account"))
     if args.loyalty_points and args.dt == "Sales Order":
@@ -1413,6 +1463,11 @@ def get_customer_info(customer):
     res["loyalty_program"] = customer.loyalty_program
     res["customer_price_list"] = customer.default_price_list
     res["customer_group"] = customer.customer_group
+    res["customer_type"] = customer.customer_type
+    res["territory"] = customer.territory
+    res["birthday"] = customer.posa_birthday
+    res["gender"] = customer.gender
+    res["tax_id"] = customer.tax_id
     res["posa_discount"] = customer.posa_discount
     res["name"] = customer.name
     res["customer_name"] = customer.customer_name
